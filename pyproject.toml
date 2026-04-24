@@ -15,6 +15,7 @@ dependencies = [
     "tenacity",
     "orjson",
     "pyodbc",
+    "PyYAML>=6.0",
     "snowflake-sqlalchemy",
     "databricks-sql-connector[pyarrow]",
 ]

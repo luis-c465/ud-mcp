@@ -1,5 +1,14 @@
 """Configuration models and helpers for db-mcp-server."""
 
+from .loader import (
+    ConfigError,
+    ConfigFileNotFoundError,
+    ConfigParseError,
+    ConfigValidationError,
+    load_config,
+    load_config_data,
+    load_config_text,
+)
 from .models import (
     Config,
     ConnectionConfig,
@@ -17,6 +26,10 @@ from .models import (
 
 __all__ = [
     "Config",
+    "ConfigError",
+    "ConfigFileNotFoundError",
+    "ConfigParseError",
+    "ConfigValidationError",
     "ConnectionConfig",
     "ConnectionConfigBase",
     "DatabaseConfig",
@@ -28,4 +41,7 @@ __all__ = [
     "SqlServerConnectionConfig",
     "Transport",
     "LogLevel",
+    "load_config",
+    "load_config_data",
+    "load_config_text",
 ]
