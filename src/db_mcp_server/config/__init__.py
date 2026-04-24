@@ -9,6 +9,17 @@ from .loader import (
     load_config_data,
     load_config_text,
 )
+from .secrets import (
+    EmptySecretError,
+    MissingSecretError,
+    ResolvedSecret,
+    SecretResolutionError,
+    resolve_env_secret,
+    resolve_env_secret_value,
+    resolve_env_secret_values,
+    resolve_env_secrets,
+    secret_refs_from_mapping,
+)
 from .models import (
     Config,
     ConnectionConfig,
@@ -30,11 +41,15 @@ __all__ = [
     "ConfigFileNotFoundError",
     "ConfigParseError",
     "ConfigValidationError",
+    "EmptySecretError",
     "ConnectionConfig",
     "ConnectionConfigBase",
+    "MissingSecretError",
     "DatabaseConfig",
     "DatabricksConnectionConfig",
     "DefaultsConfig",
+    "ResolvedSecret",
+    "SecretResolutionError",
     "PermissionMode",
     "ServerConfig",
     "SnowflakeConnectionConfig",
@@ -44,4 +59,9 @@ __all__ = [
     "load_config",
     "load_config_data",
     "load_config_text",
+    "resolve_env_secret",
+    "resolve_env_secret_value",
+    "resolve_env_secret_values",
+    "resolve_env_secrets",
+    "secret_refs_from_mapping",
 ]
