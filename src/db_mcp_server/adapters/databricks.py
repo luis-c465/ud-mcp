@@ -59,22 +59,24 @@ class DatabricksAdapter:
 
     def list_schemas(self) -> list[SchemaInfo]:
         started = perf_counter()
-        rows, _ = self._run_metadata_query(
-            (
-                "SELECT catalog_name, schema_name, comment "
-                "FROM system.information_schema.schemata "
-                "ORDER BY catalog_name, schema_name",
-                "SELECT catalog_name, schema_name, comment "
-                "FROM information_schema.schemata "
-                "ORDER BY catalog_name, schema_name",
-            )
+        effective_catalog = self.config.catalog
+        sources = self._metadata_sources("schemata", catalog=effective_catalog)
+        statements = tuple(
+            "SELECT catalog_name, schema_name, comment "
+            f"FROM {source} "
+            "ORDER BY catalog_name, schema_name"
+            for source in sources
         )
+        try:
+            rows, _ = self._run_metadata_query(statements)
+        except Exception:
+            rows, _ = self._run_show_schemas_query(catalog=effective_catalog)
         return [
             SchemaInfo(
                 catalog=self._string_or_none(row[0]),
                 schema=self._string_or_none(row[1]),
                 name=self._string_or_none(row[1]) or self._string_or_none(row[0]) or "schema",
-                description=self._string_or_none(row[2]),
+                description=self._string_or_none(row[2]) if len(row) > 2 else None,
                 backend_metadata=self._backend_metadata(
                     query_kind="list_schemas",
                     elapsed_ms=self._elapsed_ms(started),
@@ -91,9 +93,12 @@ class DatabricksAdapter:
         include_views: bool,
     ) -> list[TableInfo]:
         started = perf_counter()
-        rows, _ = self._run_metadata_query(
-            self._list_tables_sql(catalog=catalog, schema=schema, include_views=include_views)
-        )
+        try:
+            rows, _ = self._run_metadata_query(
+                self._list_tables_sql(catalog=catalog, schema=schema, include_views=include_views)
+            )
+        except Exception:
+            rows, _ = self._run_show_tables_query(catalog=catalog, schema=schema)
         return [self._table_info_from_row(row, started=started) for row in rows]
 
     def describe_table(self, catalog: str | None, schema: str, table: str) -> TableDescription:
@@ -185,7 +190,7 @@ class DatabricksAdapter:
         last_error: Exception | None = None
         for statement in statements:
             try:
-                columns, rows = self._run_query(statement, {})
+                _columns, rows = self._run_query(statement, {})
                 return rows, statement
             except Exception as exc:  # pragma: no cover - backend-specific fallback path
                 last_error = exc
@@ -194,13 +199,77 @@ class DatabricksAdapter:
         assert last_error is not None
         raise last_error
 
+    def _run_show_schemas_query(self, *, catalog: str | None) -> tuple[list[list[Any]], str]:
+        statement = self._show_schemas_sql(catalog)
+        _columns, rows = self._run_query(statement, {})
+        normalized_rows = [
+            [catalog, self._string_or_none(row[0]), None]
+            for row in rows
+        ]
+        return normalized_rows, statement
+
+    def _run_show_tables_query(self, *, catalog: str | None, schema: str | None) -> tuple[list[list[Any]], str]:
+        effective_catalog = catalog or self.config.catalog
+        effective_schema = schema or self.config.schema_
+
+        if effective_schema is not None:
+            statement = self._show_tables_sql(catalog=effective_catalog, schema=effective_schema)
+            _columns, rows = self._run_query(statement, {})
+            normalized_rows = [self._normalize_show_table_row(row, catalog=effective_catalog, schema=effective_schema) for row in rows]
+            return normalized_rows, statement
+
+        if effective_catalog is not None:
+            schema_rows, _ = self._run_show_schemas_query(catalog=effective_catalog)
+            normalized_rows: list[list[Any]] = []
+            statements: list[str] = []
+            for schema_row in schema_rows:
+                schema_name = self._string_or_none(schema_row[1])
+                if schema_name is None:
+                    continue
+                statement = self._show_tables_sql(catalog=effective_catalog, schema=schema_name)
+                statements.append(statement)
+                _columns, rows = self._run_query(statement, {})
+                normalized_rows.extend(
+                    self._normalize_show_table_row(row, catalog=effective_catalog, schema=schema_name)
+                    for row in rows
+                )
+            return normalized_rows, " ; ".join(statements)
+
+        statement = self._show_tables_sql(catalog=None, schema=None)
+        _columns, rows = self._run_query(statement, {})
+        normalized_rows = [self._normalize_show_table_row(row, catalog=None, schema=None) for row in rows]
+        return normalized_rows, statement
+
+    def _show_schemas_sql(self, catalog: str | None) -> str:
+        if catalog is None:
+            return "SHOW SCHEMAS"
+        return f"SHOW SCHEMAS IN {self._quote_identifier(catalog)}"
+
+    def _show_tables_sql(self, *, catalog: str | None, schema: str | None) -> str:
+        if schema is None:
+            return "SHOW TABLES"
+        target = self._qualified_schema_name(catalog=catalog, schema=schema)
+        return f"SHOW TABLES IN {target}"
+
+    def _normalize_show_table_row(self, row: Sequence[Any], *, catalog: str | None, schema: str | None) -> list[Any]:
+        table_schema = self._string_or_none(row[0]) or schema
+        table_name = self._string_or_none(row[1]) or ""
+        is_temporary = row[2] if len(row) > 2 else None
+        return [catalog, table_schema, table_name, "TABLE", None, None, is_temporary]
+
+    def _qualified_schema_name(self, *, catalog: str | None, schema: str) -> str:
+        quoted_schema = self._quote_identifier(schema)
+        if catalog is None:
+            return quoted_schema
+        return f"{self._quote_identifier(catalog)}.{quoted_schema}"
+
     def _list_tables_sql(
         self,
         *,
         catalog: str | None,
         schema: str | None,
         include_views: bool,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, ...]:
         effective_catalog = catalog or self.config.catalog
         effective_schema = schema or self.config.schema_
 
@@ -216,15 +285,13 @@ class DatabricksAdapter:
         if where_clauses:
             where_sql = " WHERE " + " AND ".join(where_clauses)
 
-        return (
-            "SELECT table_catalog, table_schema, table_name, table_type, comment, is_insertable_into, is_temporary "
-            "FROM system.information_schema.tables"
+        sources = self._metadata_sources("tables", catalog=effective_catalog)
+        return tuple(
+            "SELECT table_catalog, table_schema, table_name, table_type, comment, is_insertable_into "
+            f"FROM {source}"
             f"{where_sql}"
-            " ORDER BY table_catalog, table_schema, table_name",
-            "SELECT table_catalog, table_schema, table_name, table_type, comment, is_insertable_into, is_temporary "
-            "FROM information_schema.tables"
-            f"{where_sql}"
-            " ORDER BY table_catalog, table_schema, table_name",
+            " ORDER BY table_catalog, table_schema, table_name"
+            for source in sources
         )
 
     def _describe_table_info(self, catalog: str | None, schema: str | None, table: str) -> TableInfo:
@@ -250,7 +317,7 @@ class DatabricksAdapter:
             description=self._string_or_none(row[4]),
             is_view=self._is_view_type(table_type),
             is_insertable=self._coerce_bool(row[5]),
-            is_temporary=self._coerce_bool(row[6]),
+            is_temporary=self._coerce_bool(row[6]) if len(row) > 6 else None,
             backend_metadata=self._backend_metadata(
                 query_kind="describe_table",
                 catalog=catalog,
@@ -261,7 +328,7 @@ class DatabricksAdapter:
             ),
         )
 
-    def _describe_table_sql(self, *, catalog: str | None, schema: str | None, table: str) -> tuple[str, str]:
+    def _describe_table_sql(self, *, catalog: str | None, schema: str | None, table: str) -> tuple[str, ...]:
         where_clauses: list[str] = [f"table_name = {self._sql_literal(table)}"]
         if catalog is not None:
             where_clauses.append(f"table_catalog = {self._sql_literal(catalog)}")
@@ -269,15 +336,13 @@ class DatabricksAdapter:
             where_clauses.append(f"table_schema = {self._sql_literal(schema)}")
 
         where_sql = " WHERE " + " AND ".join(where_clauses)
-        return (
-            "SELECT table_catalog, table_schema, table_name, table_type, comment, is_insertable_into, is_temporary "
-            "FROM system.information_schema.tables"
+        sources = self._metadata_sources("tables", catalog=catalog)
+        return tuple(
+            "SELECT table_catalog, table_schema, table_name, table_type, comment, is_insertable_into "
+            f"FROM {source}"
             f"{where_sql}"
-            " ORDER BY table_catalog, table_schema, table_name",
-            "SELECT table_catalog, table_schema, table_name, table_type, comment, is_insertable_into, is_temporary "
-            "FROM information_schema.tables"
-            f"{where_sql}"
-            " ORDER BY table_catalog, table_schema, table_name",
+            " ORDER BY table_catalog, table_schema, table_name"
+            for source in sources
         )
 
     def _describe_columns(self, catalog: str | None, schema: str | None, table: str) -> list[ColumnInfo]:
@@ -286,7 +351,7 @@ class DatabricksAdapter:
         )
         return [self._column_info_from_metadata_row(row) for row in rows]
 
-    def _describe_columns_sql(self, *, catalog: str | None, schema: str | None, table: str) -> tuple[str, str]:
+    def _describe_columns_sql(self, *, catalog: str | None, schema: str | None, table: str) -> tuple[str, ...]:
         where_clauses: list[str] = [f"table_name = {self._sql_literal(table)}"]
         if catalog is not None:
             where_clauses.append(f"table_catalog = {self._sql_literal(catalog)}")
@@ -294,17 +359,14 @@ class DatabricksAdapter:
             where_clauses.append(f"table_schema = {self._sql_literal(schema)}")
 
         where_sql = " WHERE " + " AND ".join(where_clauses)
-        return (
+        sources = self._metadata_sources("columns", catalog=catalog)
+        return tuple(
             "SELECT table_catalog, table_schema, table_name, column_name, ordinal_position, data_type, is_nullable, "
             "column_default, comment, character_maximum_length, numeric_precision, numeric_scale "
-            "FROM system.information_schema.columns"
+            f"FROM {source}"
             f"{where_sql}"
-            " ORDER BY ordinal_position",
-            "SELECT table_catalog, table_schema, table_name, column_name, ordinal_position, data_type, is_nullable, "
-            "column_default, comment, character_maximum_length, numeric_precision, numeric_scale "
-            "FROM information_schema.columns"
-            f"{where_sql}"
-            " ORDER BY ordinal_position",
+            " ORDER BY ordinal_position"
+            for source in sources
         )
 
     def _column_info_from_description(self, column: Any, position: int) -> ColumnInfo:
@@ -351,7 +413,7 @@ class DatabricksAdapter:
             description=self._string_or_none(row[4]),
             is_view=self._is_view_type(table_type),
             is_insertable=self._coerce_bool(row[5]),
-            is_temporary=self._coerce_bool(row[6]),
+            is_temporary=self._coerce_bool(row[6]) if len(row) > 6 else None,
             backend_metadata=self._backend_metadata(
                 query_kind="list_tables",
                 table_type=table_type,
@@ -445,6 +507,27 @@ class DatabricksAdapter:
 
     def _elapsed_ms(self, started: float) -> float:
         return (perf_counter() - started) * 1000.0
+
+    def _metadata_sources(self, object_name: str, *, catalog: str | None) -> tuple[str, ...]:
+        system_source = f"system.information_schema.{object_name}"
+        if not catalog:
+            return (system_source, f"information_schema.{object_name}")
+
+        normalized_catalog = catalog.strip()
+        if not normalized_catalog:
+            return (system_source, f"information_schema.{object_name}")
+
+        if normalized_catalog.lower() == "system":
+            return (system_source,)
+
+        local_source = self._qualified_information_schema(normalized_catalog, object_name)
+        return (system_source, local_source)
+
+    def _qualified_information_schema(self, catalog: str, object_name: str) -> str:
+        return f"{self._quote_identifier(catalog)}.information_schema.{self._quote_identifier(object_name)}"
+
+    def _quote_identifier(self, value: str) -> str:
+        return "`" + value.replace("`", "``") + "`"
 
     def _sql_literal(self, value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
